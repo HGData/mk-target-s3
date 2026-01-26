@@ -1,7 +1,3 @@
-import re
-import inflection
-import json
-import collections
 import logging
 from datetime import datetime
 from abc import ABCMeta, abstractmethod
@@ -98,6 +94,29 @@ class FormatBase(metaclass=ABCMeta):
         self._prepare_records()
         # write records to S3
         self._write()
+
+    def strip_utf8_surrogates(self, s: str) -> str:
+        """Remove UTF-16 surrogate code points (invalid Unicode scalars).
+
+        :param s: Input string potentially containing surrogates
+        :return: String with surrogates removed
+        """
+        return "".join(ch for ch in s if not (0xD800 <= ord(ch) <= 0xDFFF))
+
+    def sanitize_utf8(self, obj):
+        """Sanitise strings and those in nested data structures
+        by removing UTF-8 surrogates (invalid Unicode scalars).
+
+        :param obj: Object to sanitize (dict, list, str, or other)
+        :return: Sanitized object with surrogates removed from all strings
+        """
+        if isinstance(obj, dict):
+            return {k: self.sanitize_utf8(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self.sanitize_utf8(v) for v in obj]
+        if isinstance(obj, str):
+            return self.strip_utf8_surrogates(obj)
+        return obj
 
     @abstractmethod
     def _prepare_records(self) -> None:
