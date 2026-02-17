@@ -40,7 +40,8 @@ class FormatJsonl(FormatBase):
         pass
 
     def _prepare_records(self):
-        # use default behavior, no additional prep needed
+        # Sanitize UTF-8 surrogates from all records
+        self.records = [self.sanitize_utf8(record) for record in self.records]
         return super()._prepare_records()
 
     def _write(self) -> None:
