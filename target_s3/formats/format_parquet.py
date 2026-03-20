@@ -1,4 +1,6 @@
 import json
+import random
+import time
 from typing import List, Tuple, Union
 
 import pyarrow
@@ -392,22 +394,39 @@ class FormatParquet(FormatBase):
 
     def _write(self, contents: str = None) -> None:
         df = self.create_dataframe()
-        try:
-            ParquetWriter(
-                f"{self.fully_qualified_key}.{self.extension}",
-                df.schema,
-                compression="gzip",  # TODO: support multiple compression types
-                filesystem=self.file_system,
-            ).write_table(df)
-        except Exception as e:
-            self.logger.error(e)
-            if type(e) is pyarrow.lib.ArrowNotImplementedError:
+        max_retries = 5
+        base_delay = 2.0
+        for attempt in range(max_retries + 1):
+            try:
+                ParquetWriter(
+                    f"{self.fully_qualified_key}.{self.extension}",
+                    df.schema,
+                    compression="gzip",  # TODO: support multiple compression types
+                    filesystem=self.file_system,
+                ).write_table(df)
+                return
+            except pyarrow.lib.ArrowNotImplementedError as e:
+                self.logger.error(e)
                 self.logger.error(
                     """Failed to write parquet file to S3. Complex types [array, object] in schema cannot be left without type definition """
                 )
-            else:
+                raise e
+            except OSError as e:
+                if attempt == max_retries:
+                    self.logger.error(
+                        f"Parquet S3 write failed after {max_retries + 1} attempts: {e}"
+                    )
+                    raise e
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                self.logger.warning(
+                    f"Parquet S3 write attempt {attempt + 1} failed ({e}), "
+                    f"retrying in {delay:.1f}s..."
+                )
+                time.sleep(delay)
+            except Exception as e:
+                self.logger.error(e)
                 self.logger.error("Failed to write parquet file to S3.")
-            raise e
+                raise e
 
     def run(self) -> None:
         # use default behavior, no additional run steps needed

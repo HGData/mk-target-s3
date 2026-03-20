@@ -1,8 +1,12 @@
 import logging
+import random
+import time
 from datetime import datetime
 from abc import ABCMeta, abstractmethod
 
 from boto3 import Session
+from botocore.config import Config
+from botocore.exceptions import ClientError
 from smart_open import open
 
 
@@ -52,17 +56,31 @@ class FormatBase(metaclass=ABCMeta):
             assert aws_config, "FormatBase.__init__: Expecting aws in configuration"
 
             self.bucket = aws_config.get("aws_bucket", None)  # required
-            self.session = Session(
-                aws_access_key_id=aws_config.get("aws_access_key_id", None),
-                aws_secret_access_key=aws_config.get("aws_secret_access_key", None),
-                aws_session_token=aws_config.get("aws_session_token", None),
-                region_name=aws_config.get("aws_region"),
-                profile_name=aws_config.get("aws_profile_name", None),
-            )
-            self.client = self.session.client(
-                "s3",
-                endpoint_url=aws_config.get("aws_endpoint_override", None),
-            )
+
+            # Reuse pre-built session/client from sink if available (avoids
+            # creating a new boto3 Session + S3 client on every batch flush)
+            if context.get("s3_session"):
+                self.session = context["s3_session"]
+            else:
+                self.session = Session(
+                    aws_access_key_id=aws_config.get("aws_access_key_id", None),
+                    aws_secret_access_key=aws_config.get("aws_secret_access_key", None),
+                    aws_session_token=aws_config.get("aws_session_token", None),
+                    region_name=aws_config.get("aws_region"),
+                    profile_name=aws_config.get("aws_profile_name", None),
+                )
+
+            if context.get("s3_client"):
+                self.client = context["s3_client"]
+            else:
+                s3_retry_config = Config(
+                    retries={"mode": "adaptive", "max_attempts": 10}
+                )
+                self.client = self.session.client(
+                    "s3",
+                    endpoint_url=aws_config.get("aws_endpoint_override", None),
+                    config=s3_retry_config,
+                )
 
         steam_name: str = self.context["stream_name"]
         self.prefix = config.get("prefix", None)
@@ -76,15 +94,30 @@ class FormatBase(metaclass=ABCMeta):
 
     @abstractmethod
     def _write(self, contents: str = None) -> None:
-        """Execute the write to S3. (default)"""
-        # TODO: create dynamic cloud
-        # TODO: is there a better way to handle write contents ?
-        with open(
-            f"s3://{self.fully_qualified_key}",
-            "w",
-            transport_params={"client": self.client},
-        ) as f:
-            f.write(contents)
+        """Execute the write to S3 with retry on transient S3 errors."""
+        max_retries = 5
+        base_delay = 2.0
+        for attempt in range(max_retries + 1):
+            try:
+                with open(
+                    f"s3://{self.fully_qualified_key}",
+                    "w",
+                    transport_params={"client": self.client},
+                ) as f:
+                    f.write(contents)
+                return
+            except (ValueError, ClientError) as e:
+                if attempt == max_retries:
+                    self.logger.error(
+                        f"S3 write failed after {max_retries + 1} attempts: {e}"
+                    )
+                    raise
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                self.logger.warning(
+                    f"S3 write attempt {attempt + 1} failed ({e}), "
+                    f"retrying in {delay:.1f}s..."
+                )
+                time.sleep(delay)
 
     @abstractmethod
     def run(self, records) -> None:
