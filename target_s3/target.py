@@ -191,6 +191,13 @@ class Targets3(Target):
             default=10000,
         ),
         th.Property(
+            "max_parallelism",
+            th.IntegerType,
+            description="Maximum number of streams to flush to S3 concurrently.Reduce to limit concurrent CreateMultipartUpload calls on throttled buckets.",
+            required=False,
+            default=8,
+        ),
+        th.Property(
             "partition_by",
             th.ArrayType(th.StringType),
             required=False,
@@ -215,6 +222,10 @@ class Targets3(Target):
     @property
     def _MAX_RECORD_AGE_IN_MINUTES(self) -> float:  # type: ignore
         return float(self.config.get("max_batch_age", 5.0))
+
+    @property
+    def _MAX_PARALLELISM(self) -> int:
+        return int(self.config.get("max_parallelism", 8))
 
     def deserialize_json(self, line: str) -> dict:
         """Override base target's method to overcome Decimal cast,
