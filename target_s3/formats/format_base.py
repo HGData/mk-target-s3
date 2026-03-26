@@ -1,9 +1,8 @@
 import logging
-import random
-import time
 from datetime import datetime
 from abc import ABCMeta, abstractmethod
 
+import backoff
 from boto3 import Session
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -95,29 +94,27 @@ class FormatBase(metaclass=ABCMeta):
     @abstractmethod
     def _write(self, contents: str = None) -> None:
         """Execute the write to S3 with retry on transient S3 errors."""
-        max_retries = 5
-        base_delay = 2.0
-        for attempt in range(max_retries + 1):
-            try:
-                with open(
-                    f"s3://{self.fully_qualified_key}",
-                    "w",
-                    transport_params={"client": self.client},
-                ) as f:
-                    f.write(contents)
-                return
-            except (ValueError, ClientError) as e:
-                if attempt == max_retries:
-                    self.logger.error(
-                        f"S3 write failed after {max_retries + 1} attempts: {e}"
-                    )
-                    raise
-                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                self.logger.warning(
-                    f"S3 write attempt {attempt + 1} failed ({e}), "
-                    f"retrying in {delay:.1f}s..."
-                )
-                time.sleep(delay)
+
+        @backoff.on_exception(
+            backoff.expo,
+            (ValueError, ClientError),
+            max_tries=3,
+            max_time=60,
+            jitter=backoff.full_jitter,
+            on_backoff=lambda details: self.logger.warning(
+                f"S3 write attempt {details['tries']} failed, "
+                f"retrying in {details['wait']:.1f}s..."
+            ),
+        )
+        def _write_with_retry():
+            with open(
+                f"s3://{self.fully_qualified_key}",
+                "w",
+                transport_params={"client": self.client},
+            ) as f:
+                f.write(contents)
+
+        _write_with_retry()
 
     @abstractmethod
     def run(self, records) -> None:
