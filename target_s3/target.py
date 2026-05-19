@@ -3,15 +3,30 @@
 from __future__ import annotations
 import decimal
 import json
+import logging
+import os
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 from singer_sdk.target_base import Target
 from singer_sdk import typing as th
+from smart_open import open as smart_open
 
 from target_s3.formats.format_base import DATE_GRAIN
 
 from target_s3.sinks import (
     s3Sink,
 )
+
+LOGGER = logging.getLogger("target-s3")
+
+# Env var pointing at the S3 URI where the post-run extraction manifest should
+# be written. Set by the orchestrator (Airflow MDI DAG callback uses it to
+# locate + read the manifest, then POSTs to argo's data_extraction_runs
+# endpoint as part of the RGI-950 skip-gate signal). When unset, manifest
+# emission is skipped silently — keeps this target usable as a generic Singer
+# target outside the MDI pipeline.
+EXTRACTION_MANIFEST_S3_URI_ENV = "EXTRACTION_MANIFEST_S3_URI"
 
 
 class Targets3(Target):
@@ -212,9 +227,75 @@ class Targets3(Target):
 
     default_sink_class = s3Sink
 
+    def __init__(self, *args, **kwargs) -> None:  # noqa: D401
+        super().__init__(*args, **kwargs)
+        # Captured at target instantiation. The Singer SDK runs the target
+        # for the duration of one tap+target invocation, so this is a good
+        # proxy for the extraction's start time.
+        self._extraction_started_at: datetime = datetime.now(tz=timezone.utc)
+
     @property
     def _MAX_RECORD_AGE_IN_MINUTES(self) -> float:  # type: ignore
         return float(self.config.get("max_batch_age", 5.0))
+
+    def _process_endofpipe(self) -> None:
+        """Override the SDK lifecycle hook to emit a manifest after final drain.
+
+        super() finishes draining all sinks, then we aggregate per-sink record
+        counts and write a JSON manifest to the URI given by
+        EXTRACTION_MANIFEST_S3_URI. Failure to emit the manifest never raises
+        — the tap+target run is already complete by the time we get here, and
+        the manifest is an observability signal that callers (Airflow → argo)
+        fail-open on.
+        """
+        super()._process_endofpipe()
+        try:
+            self._emit_extraction_manifest()
+        except Exception as exc:  # noqa: BLE001 — must never raise here
+            LOGGER.warning(
+                "target-s3: failed to emit extraction manifest: %s", exc, exc_info=True
+            )
+
+    def _emit_extraction_manifest(self) -> None:
+        manifest_uri = os.environ.get(EXTRACTION_MANIFEST_S3_URI_ENV)
+        if not manifest_uri:
+            LOGGER.debug(
+                "target-s3: %s unset, skipping manifest emission",
+                EXTRACTION_MANIFEST_S3_URI_ENV,
+            )
+            return
+
+        ended_at = datetime.now(tz=timezone.utc)
+
+        # Per-stream + total record counts come straight from the SDK sink
+        # counters (set via tally_record_written). After _process_endofpipe's
+        # drain_all, sinks remain in _sinks_active with finalised totals.
+        by_stream: dict[str, int] = {}
+        total_records = 0
+        for stream_name, sink in self._sinks_active.items():
+            written = getattr(sink, "_total_records_written", 0) or 0
+            by_stream[stream_name] = written
+            total_records += written
+
+        manifest = {
+            "tenant": self.config.get("tenant"),
+            "started_at": self._extraction_started_at.isoformat(),
+            "ended_at": ended_at.isoformat(),
+            "records_extracted": total_records,
+            "by_stream": by_stream,
+        }
+
+        # smart_open routes s3:// URIs through boto3 using the default
+        # credential chain — same chain target-s3's sinks already rely on.
+        with smart_open(manifest_uri, "w") as f:
+            f.write(json.dumps(manifest, indent=2))
+
+        LOGGER.info(
+            "target-s3: wrote extraction manifest (records=%d, streams=%d) to %s",
+            total_records,
+            len(by_stream),
+            _sanitize_log_uri(manifest_uri),
+        )
 
     def deserialize_json(self, line: str) -> dict:
         """Override base target's method to overcome Decimal cast,
@@ -237,6 +318,15 @@ class Targets3(Target):
         except json.decoder.JSONDecodeError as exc:
             self.logger.error("Unable to parse:\n%s", line, exc_info=exc)
             raise
+
+
+def _sanitize_log_uri(uri: str) -> str:
+    """Strip query string / fragments for safe logging — bucket + key only."""
+    try:
+        p = urlparse(uri)
+        return f"{p.scheme}://{p.netloc}{p.path}"
+    except Exception:  # noqa: BLE001
+        return uri
 
 
 if __name__ == "__main__":
