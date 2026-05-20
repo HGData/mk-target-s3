@@ -8,6 +8,7 @@ import os
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+from boto3 import Session
 from singer_sdk.target_base import Target
 from singer_sdk import typing as th
 from smart_open import open as smart_open
@@ -285,9 +286,17 @@ class Targets3(Target):
             "by_stream": by_stream,
         }
 
-        # smart_open routes s3:// URIs through boto3 using the default
-        # credential chain — same chain target-s3's sinks already rely on.
-        with smart_open(manifest_uri, "w") as f:
+        # Use the same explicit credentials the sinks use for data writes.
+        # Without `transport_params={"client": ...}`, smart_open falls through
+        # to the default boto3 chain — in ECS that resolves to the task role,
+        # which may not have PutObject on the target bucket even when the
+        # IAM-user creds in cloud_provider.aws do.
+        transport_params: dict = {}
+        s3_client = self._build_s3_client()
+        if s3_client is not None:
+            transport_params["client"] = s3_client
+
+        with smart_open(manifest_uri, "w", transport_params=transport_params) as f:
             f.write(json.dumps(manifest, indent=2))
 
         LOGGER.info(
@@ -295,6 +304,29 @@ class Targets3(Target):
             total_records,
             len(by_stream),
             _sanitize_log_uri(manifest_uri),
+        )
+
+    def _build_s3_client(self):
+        """Build an S3 client from the target's cloud_provider config.
+
+        Mirrors the boto3 session built per-sink in sinks.py. Returns None
+        when cloud_provider isn't AWS — caller then lets smart_open fall back
+        to its default credential resolution.
+        """
+        cloud_provider = self.config.get("cloud_provider") or {}
+        if cloud_provider.get("cloud_provider_type") != "aws":
+            return None
+        aws_config = cloud_provider.get("aws") or {}
+        session = Session(
+            aws_access_key_id=aws_config.get("aws_access_key_id"),
+            aws_secret_access_key=aws_config.get("aws_secret_access_key"),
+            aws_session_token=aws_config.get("aws_session_token"),
+            region_name=aws_config.get("aws_region"),
+            profile_name=aws_config.get("aws_profile_name"),
+        )
+        return session.client(
+            "s3",
+            endpoint_url=aws_config.get("aws_endpoint_override"),
         )
 
     def deserialize_json(self, line: str) -> dict:
