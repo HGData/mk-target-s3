@@ -265,9 +265,12 @@ class Targets3(Target):
         STATE message (e.g. Argo credential fetch fails at login) makes this
         target emit `{}` at end-of-pipe — which Meltano then persists over the
         tenant's real bookmarks, downgrading every subsequent run to a full
-        pull. Newer SDKs (>=0.47.0) skip emission when no state was received;
-        this backports that guard. An empty Singer state carries no bookmarks,
-        so suppressing it is always safe.
+        pull. Upstream fixed this in 0.46.1 with a None sentinel (meltano/sdk
+        #3034), then deliberately broadened it in 0.47.0 to also suppress a
+        received-but-empty state (meltano/sdk#3040: "previously valid state
+        being overwritten, potentially causing state loss"); the truthiness
+        check here backports the 0.47.0+ behavior. An empty Singer state
+        carries no bookmarks, so suppressing it is always safe.
         """
         if not state:
             LOGGER.info(

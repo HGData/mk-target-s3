@@ -65,6 +65,22 @@ def test_endofpipe_with_no_input_emits_no_state(monkeypatch, capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_received_empty_state_is_also_suppressed(monkeypatch, capsys):
+    """A tap-emitted `STATE {}` is suppressed too, matching singer-sdk >=0.47.0.
+
+    Deliberate, not an accident: upstream introduced a None-sentinel guard in
+    0.46.1 (meltano/sdk#3034) and broadened it in 0.47.0 (meltano/sdk#3040)
+    because persisting a received empty state still overwrites valid bookmarks
+    — the same wipe RGI-1651 fixes. State resets are operational
+    (`meltano state clear`), never signalled through the pipe.
+    """
+    monkeypatch.delenv(EXTRACTION_MANIFEST_S3_URI_ENV, raising=False)
+    target = _make_target()
+    target._process_state_message({"type": "STATE", "value": {}})
+    target._process_endofpipe()
+    assert capsys.readouterr().out == ""
+
+
 def test_endofpipe_after_state_received_still_emits(monkeypatch, capsys):
     """A normally-completing run still emits its final state at end-of-pipe."""
     monkeypatch.delenv(EXTRACTION_MANIFEST_S3_URI_ENV, raising=False)
