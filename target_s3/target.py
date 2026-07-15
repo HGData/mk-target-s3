@@ -257,6 +257,28 @@ class Targets3(Target):
                 "target-s3: failed to emit extraction manifest: %s", exc, exc_info=True
             )
 
+    def _write_state_message(self, state: dict) -> None:
+        """Override the SDK hook to never emit an empty state (RGI-1651).
+
+        singer-sdk 0.33.1 initialises `_latest_state` to `{}` and emits it
+        unconditionally on every drain, so a tap that dies before sending any
+        STATE message (e.g. Argo credential fetch fails at login) makes this
+        target emit `{}` at end-of-pipe — which Meltano then persists over the
+        tenant's real bookmarks, downgrading every subsequent run to a full
+        pull. Upstream fixed this in 0.46.1 with a None sentinel (meltano/sdk
+        #3034), then deliberately broadened it in 0.47.0 to also suppress a
+        received-but-empty state (meltano/sdk#3040: "previously valid state
+        being overwritten, potentially causing state loss"); the truthiness
+        check here backports the 0.47.0+ behavior. An empty Singer state
+        carries no bookmarks, so suppressing it is always safe.
+        """
+        if not state:
+            LOGGER.info(
+                "target-s3: no state received from tap; skipping state emission"
+            )
+            return
+        super()._write_state_message(state)
+
     def _emit_extraction_manifest(self) -> None:
         manifest_uri = os.environ.get(EXTRACTION_MANIFEST_S3_URI_ENV)
         if not manifest_uri:
