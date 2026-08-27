@@ -29,6 +29,16 @@ LOGGER = logging.getLogger("target-s3")
 # target outside the MDI pipeline.
 EXTRACTION_MANIFEST_S3_URI_ENV = "EXTRACTION_MANIFEST_S3_URI"
 
+# Env var pointing at the S3 URI where the post-run Iceberg ingestion descriptor should be written.
+# Set by the orchestrator; the iceberg ingestion DAG reads it to learn which streams landed, the
+# partitions each wrote, and the schema each carried. A separate file from the freshness manifest
+# above. Unset -> descriptor emission is skipped, keeping this usable as a generic Singer target.
+INGESTION_DESCRIPTOR_S3_URI_ENV = "INGESTION_DESCRIPTOR_S3_URI"
+
+# The single partition column the Iceberg int layer filters a load on. target-s3 writes it as the
+# last `dt=` segment of each key (dynamic_dt), and the descriptor names it as the partition key.
+_DT_PARTITION_MARKER = "/dt="
+
 
 class Targets3(Target):
     """Sample target for s3."""
@@ -256,6 +266,12 @@ class Targets3(Target):
             LOGGER.warning(
                 "target-s3: failed to emit extraction manifest: %s", exc, exc_info=True
             )
+        try:
+            self._emit_ingestion_descriptor()
+        except Exception as exc:  # noqa: BLE001 — must never raise here
+            LOGGER.warning(
+                "target-s3: failed to emit ingestion descriptor: %s", exc, exc_info=True
+            )
 
     def _write_state_message(self, state: dict) -> None:
         """Override the SDK hook to never emit an empty state (RGI-1651).
@@ -328,6 +344,76 @@ class Targets3(Target):
             _sanitize_log_uri(manifest_uri),
         )
 
+    def _emit_ingestion_descriptor(self) -> None:
+        """Write the Iceberg ingestion descriptor: one entry per stream with its landed partitions.
+
+        The descriptor carries only what landed — streams, their ``dt`` partitions and locations, and
+        the Singer schema each was extracted under. It does not carry service/tenant/connector: the
+        ingestion DAG supplies those. A stream that wrote no ``dt``-partitioned files this run is
+        omitted (there is nothing to stage for it).
+        """
+        descriptor_uri = os.environ.get(INGESTION_DESCRIPTOR_S3_URI_ENV)
+        if not descriptor_uri:
+            LOGGER.debug(
+                "target-s3: %s unset, skipping descriptor emission",
+                INGESTION_DESCRIPTOR_S3_URI_ENV,
+            )
+            return
+
+        extracted_at = datetime.now(tz=timezone.utc).isoformat()
+        streams = []
+        for stream_name, sink in self._sinks_active.items():
+            written_keys = getattr(sink, "_written_keys", None) or set()
+            table_root = None
+            # dt value -> location; a dict so replayed batches for one partition collapse to one arrival.
+            partitions: dict[str, str] = {}
+            for key in written_keys:
+                parsed = _parse_dt_partition(key)
+                if parsed is None:
+                    continue
+                table_root, dt_value, location = parsed
+                partitions[dt_value] = location
+
+            if not partitions or table_root is None:
+                LOGGER.warning(
+                    "target-s3: stream %s wrote no dt-partitioned files; omitting from descriptor",
+                    stream_name,
+                )
+                continue
+
+            arrivals = [
+                {
+                    "extracted_at": extracted_at,
+                    "partition": {"values": {"dt": dt_value}, "location": location},
+                    "schema": sink.schema,
+                }
+                for dt_value, location in sorted(partitions.items())
+            ]
+            streams.append(
+                {
+                    "stream": stream_name,
+                    "table_root": table_root,
+                    "partition_keys": [{"name": "dt", "type": "string"}],
+                    "arrivals": arrivals,
+                }
+            )
+
+        descriptor = {"version": 1, "streams": streams}
+
+        transport_params: dict = {}
+        s3_client = self._build_s3_client()
+        if s3_client is not None:
+            transport_params["client"] = s3_client
+
+        with smart_open(descriptor_uri, "w", transport_params=transport_params) as f:
+            f.write(json.dumps(descriptor, indent=2))
+
+        LOGGER.info(
+            "target-s3: wrote ingestion descriptor (streams=%d) to %s",
+            len(streams),
+            _sanitize_log_uri(descriptor_uri),
+        )
+
     def _build_s3_client(self):
         """Build an S3 client from the target's cloud_provider config.
 
@@ -372,6 +458,28 @@ class Targets3(Target):
         except json.decoder.JSONDecodeError as exc:
             self.logger.error("Unable to parse:\n%s", line, exc_info=exc)
             raise
+
+
+def _parse_dt_partition(key: str) -> tuple[str, str, str] | None:
+    """Split a written S3 key into its table root, dt value, and partition location.
+
+    A sink key looks like ``bucket/prefix/{tenant}_{stream}/source_system=.../tenant=.../dt=VALUE/file``.
+    The constant leading partitions fold into ``table_root``; the varying ``dt`` is the partition key
+    the descriptor names.
+
+    :param key: the fully-qualified S3 key a batch wrote (no ``s3://`` scheme)
+    :return: ``(table_root, dt_value, location)`` as ``s3://`` URIs, or None if the key has no ``dt=``
+
+    """
+    idx = key.find(_DT_PARTITION_MARKER)
+    if idx == -1:
+        return None
+    table_root = f"s3://{key[:idx]}/"
+    dt_value = key[idx + len(_DT_PARTITION_MARKER):].split("/", 1)[0]
+    if not dt_value:
+        return None
+    location = f"{table_root}dt={dt_value}/"
+    return table_root, dt_value, location
 
 
 def _sanitize_log_uri(uri: str) -> str:

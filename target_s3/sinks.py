@@ -32,6 +32,9 @@ class s3Sink(BatchSink):
         # what type of file are we building?
         self.format_type = self.config.get("format", None).get("format_type", None)
         self.schema = schema
+        # S3 keys written this run, accumulated across batches. The target reads these at end-of-pipe
+        # to build the ingestion descriptor (which partitions of this stream landed, and where).
+        self._written_keys: set[str] = set()
         if self.format_type:
             if self.format_type not in FORMAT_TYPE:
                 raise Exception(
@@ -93,3 +96,8 @@ class s3Sink(BatchSink):
         ), f"format_type_client must be of type Base; Type: {type(self.format_type_client)}."
 
         format_type_client.run()
+
+        # Record the S3 key this batch wrote, for the end-of-run ingestion descriptor.
+        written_key = getattr(format_type_client, "fully_qualified_key", None)
+        if written_key:
+            self._written_keys.add(written_key)
