@@ -37,9 +37,12 @@ class s3Sink(BatchSink):
         # to build the ingestion descriptor (which partitions of this stream landed, and where).
         self._written_keys: set[str] = set()
         # Rows with a value per field, for the manifest. None when track_filled_fields is off.
-        self._filled_by_field: Counter | None = (
-            Counter() if self.config.get("track_filled_fields", False) else None
-        )
+        # Every schema field starts at 0, so a field that is empty in this run shows as 0, not missing.
+        self._filled_by_field: Counter | None = None
+        if self.config.get("track_filled_fields", False):
+            self._filled_by_field = Counter(
+                {field: 0 for field in (schema or {}).get("properties", {})}
+            )
         if self.format_type:
             if self.format_type not in FORMAT_TYPE:
                 raise Exception(

@@ -190,3 +190,24 @@ def test_emit_manifest_has_no_filled_by_stream_when_off(monkeypatch, tmp_path):
     target._emit_extraction_manifest()
 
     assert "filled_by_stream" not in json.loads(manifest_path.read_text())
+
+
+def test_sink_starts_every_schema_field_at_zero():
+    """With track_filled_fields on, a schema field that never gets a value is reported as 0."""
+    from target_s3.sinks import s3Sink
+
+    target = Targets3(config={**SAMPLE_CONFIG, "track_filled_fields": True})
+    schema = {"properties": {"id": {"type": ["string"]}, "url": {"type": ["string", "null"]}}}
+    sink = s3Sink(target, "events", schema, ["id"])
+    sink.process_record({"id": "1", "url": ""}, {"records": []})
+    assert dict(sink._filled_by_field) == {"id": 1, "url": 0}
+
+
+def test_sink_does_not_count_when_off():
+    """With track_filled_fields off, the sink keeps no counter."""
+    from target_s3.sinks import s3Sink
+
+    target = _make_target()
+    sink = s3Sink(target, "events", {"properties": {"id": {"type": ["string"]}}}, ["id"])
+    sink.process_record({"id": "1"}, {"records": []})
+    assert sink._filled_by_field is None
