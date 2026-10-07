@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import logging
+from collections import Counter
 
 from boto3 import Session
 from botocore.config import Config
@@ -35,6 +36,10 @@ class s3Sink(BatchSink):
         # S3 keys written this run, accumulated across batches. The target reads these at end-of-pipe
         # to build the ingestion descriptor (which partitions of this stream landed, and where).
         self._written_keys: set[str] = set()
+        # Rows with a value per field, for the manifest. None when track_filled_fields is off.
+        self._filled_by_field: Counter | None = (
+            Counter() if self.config.get("track_filled_fields", False) else None
+        )
         if self.format_type:
             if self.format_type not in FORMAT_TYPE:
                 raise Exception(
@@ -75,6 +80,12 @@ class s3Sink(BatchSink):
         """
         return self.config.get("max_batch_size", 10000)
 
+    def process_record(self, record: dict, context: dict) -> None:
+        """Count the fields that have a value, then queue the record as usual."""
+        if self._filled_by_field is not None:
+            count_filled_fields(self._filled_by_field, record)
+        super().process_record(record, context)
+
     def process_batch(self, context: dict) -> None:
         """Write out any prepped records and return once fully written."""
         # add stream name to context
@@ -101,3 +112,10 @@ class s3Sink(BatchSink):
         written_key = getattr(format_type_client, "fully_qualified_key", None)
         if written_key:
             self._written_keys.add(written_key)
+
+
+def count_filled_fields(counter: Counter, record: dict) -> None:
+    """Add one to each top-level field of the record that has a value. None and "" count as empty."""
+    for field, value in record.items():
+        if value is not None and value != "":
+            counter[field] += 1

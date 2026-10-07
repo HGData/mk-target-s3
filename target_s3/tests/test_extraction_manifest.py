@@ -147,3 +147,46 @@ def test_process_endofpipe_calls_emit_after_drain(monkeypatch):
         target._process_endofpipe()
 
     assert call_order == ["drain", "emit"]
+
+
+def test_count_filled_fields_skips_none_and_empty_strings():
+    """None and "" are empty; 0, False and other values count as filled."""
+    from collections import Counter
+
+    from target_s3.sinks import count_filled_fields
+
+    counter: Counter = Counter()
+    count_filled_fields(counter, {"a": "x", "b": None, "c": "", "d": 0, "e": False})
+    count_filled_fields(counter, {"a": "y", "b": "z"})
+    assert counter == {"a": 2, "b": 1, "d": 1, "e": 1}
+
+
+def test_emit_manifest_adds_filled_by_stream_when_counted(monkeypatch, tmp_path):
+    """Sinks with a filled-field counter (track_filled_fields on) add filled_by_stream."""
+    from collections import Counter
+
+    manifest_path = tmp_path / "manifest.json"
+    monkeypatch.setenv(EXTRACTION_MANIFEST_S3_URI_ENV, str(manifest_path))
+
+    events = _fake_sink(3)
+    events._filled_by_field = Counter({"context_page_url": 2, "EVENT_ID": 3})
+    target = _make_target()
+    target._sinks_active = {"events": events}
+
+    target._emit_extraction_manifest()
+
+    written = json.loads(manifest_path.read_text())
+    assert written["filled_by_stream"] == {"events": {"context_page_url": 2, "EVENT_ID": 3}}
+
+
+def test_emit_manifest_has_no_filled_by_stream_when_off(monkeypatch, tmp_path):
+    """With track_filled_fields off (no counter on any sink), the manifest stays as before."""
+    manifest_path = tmp_path / "manifest.json"
+    monkeypatch.setenv(EXTRACTION_MANIFEST_S3_URI_ENV, str(manifest_path))
+
+    target = _make_target()
+    target._sinks_active = {"events": _fake_sink(3)}
+
+    target._emit_extraction_manifest()
+
+    assert "filled_by_stream" not in json.loads(manifest_path.read_text())

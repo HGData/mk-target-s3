@@ -3,6 +3,7 @@
 from __future__ import annotations
 import decimal
 import json
+from collections import Counter
 import logging
 import os
 from datetime import datetime, timezone
@@ -229,6 +230,12 @@ class Targets3(Target):
             description="Optional tenant string to prefix S3 folder names.",
         ),
         th.Property(
+            "track_filled_fields",
+            th.BooleanType,
+            description="Count, per stream and field, how many records had a value, and add it to the extraction manifest as filled_by_stream. Used to alert when a field that usually has values starts arriving empty.",
+            default=False,
+        ),
+        th.Property(
             "dynamic_dt",
             th.BooleanType,
             description="Enable dynamic dt generation for each batch. When enabled, any 'dt=' entries in partition_by will use the current batch timestamp instead of static environment variables.",
@@ -323,6 +330,14 @@ class Targets3(Target):
             "records_extracted": total_records,
             "by_stream": by_stream,
         }
+        # Only when track_filled_fields is on: rows with a value, per stream and field.
+        filled_by_stream = {
+            stream_name: dict(sink._filled_by_field)
+            for stream_name, sink in self._sinks_active.items()
+            if isinstance(getattr(sink, "_filled_by_field", None), Counter)
+        }
+        if filled_by_stream:
+            manifest["filled_by_stream"] = filled_by_stream
 
         # Use the same explicit credentials the sinks use for data writes.
         # Without `transport_params={"client": ...}`, smart_open falls through
