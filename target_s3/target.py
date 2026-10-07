@@ -5,6 +5,7 @@ import decimal
 import json
 import logging
 import os
+from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -229,6 +230,12 @@ class Targets3(Target):
             description="Optional tenant string to prefix S3 folder names.",
         ),
         th.Property(
+            "track_filled_fields",
+            th.BooleanType,
+            description="Count, per stream and field, how many records had a value, and add it to the extraction manifest as filled_by_stream. Used to alert when a field that usually has values starts arriving empty.",
+            default=False,
+        ),
+        th.Property(
             "dynamic_dt",
             th.BooleanType,
             description="Enable dynamic dt generation for each batch. When enabled, any 'dt=' entries in partition_by will use the current batch timestamp instead of static environment variables.",
@@ -239,6 +246,9 @@ class Targets3(Target):
     default_sink_class = s3Sink
 
     def __init__(self, *args, **kwargs) -> None:  # noqa: D401
+        # Filled-field counts per stream (track_filled_fields). Kept here, not on the sink, so a sink
+        # the SDK replaces mid-run (a new SCHEMA message) keeps adding to the same counts.
+        self._filled_by_stream: dict[str, Counter] = {}
         super().__init__(*args, **kwargs)
         # Captured at target instantiation. The Singer SDK runs the target
         # for the duration of one tap+target invocation, so this is a good
@@ -272,6 +282,13 @@ class Targets3(Target):
             LOGGER.warning(
                 "target-s3: failed to emit ingestion descriptor: %s", exc, exc_info=True
             )
+
+    def filled_counter(self, stream_name: str, schema: dict | None) -> Counter:
+        """Return the stream's filled-field counter, adding any schema field it lacks at 0."""
+        counter = self._filled_by_stream.setdefault(stream_name, Counter())
+        for field in (schema or {}).get("properties", {}):
+            counter.setdefault(field, 0)
+        return counter
 
     def _write_state_message(self, state: dict) -> None:
         """Override the SDK hook to never emit an empty state (RGI-1651).
@@ -323,6 +340,11 @@ class Targets3(Target):
             "records_extracted": total_records,
             "by_stream": by_stream,
         }
+        # Only when track_filled_fields is on: rows with a value, per stream and field.
+        if self._filled_by_stream:
+            manifest["filled_by_stream"] = {
+                stream_name: dict(counter) for stream_name, counter in self._filled_by_stream.items()
+            }
 
         # Use the same explicit credentials the sinks use for data writes.
         # Without `transport_params={"client": ...}`, smart_open falls through

@@ -1,7 +1,9 @@
 """s3 target sink class, which handles writing streams."""
 
 from __future__ import annotations
+import json
 import logging
+from collections import Counter
 
 from boto3 import Session
 from botocore.config import Config
@@ -35,6 +37,12 @@ class s3Sink(BatchSink):
         # S3 keys written this run, accumulated across batches. The target reads these at end-of-pipe
         # to build the ingestion descriptor (which partitions of this stream landed, and where).
         self._written_keys: set[str] = set()
+        # Rows with a value per field, for the manifest. None when track_filled_fields is off.
+        # Held by the target per stream, so a sink the SDK replaces mid-run keeps counting into the
+        # same counter. Every schema field starts at 0, so an empty field shows as 0, not missing.
+        self._filled_by_field: Counter | None = None
+        if self.config.get("track_filled_fields", False):
+            self._filled_by_field = target.filled_counter(stream_name, schema)
         if self.format_type:
             if self.format_type not in FORMAT_TYPE:
                 raise Exception(
@@ -75,6 +83,12 @@ class s3Sink(BatchSink):
         """
         return self.config.get("max_batch_size", 10000)
 
+    def process_record(self, record: dict, context: dict) -> None:
+        """Count the fields that have a value, then queue the record as usual."""
+        if self._filled_by_field is not None:
+            count_filled_fields(self._filled_by_field, record)
+        super().process_record(record, context)
+
     def process_batch(self, context: dict) -> None:
         """Write out any prepped records and return once fully written."""
         # add stream name to context
@@ -101,3 +115,42 @@ class s3Sink(BatchSink):
         written_key = getattr(format_type_client, "fully_qualified_key", None)
         if written_key:
             self._written_keys.add(written_key)
+
+
+def _has_value(value) -> bool:
+    """None, "" and blank strings count as empty, like BLANKSASNULL in the legacy loads."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    return True
+
+
+def _as_object(value):
+    """Return the value as a dict when it is one, or JSON text of one; otherwise None."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.lstrip().startswith("{"):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def count_filled_fields(counter: Counter, record: dict) -> None:
+    """Add one to each field of the record that has a value.
+
+    A field holding an object, or JSON text of one (an S3 json column), also counts its keys one
+    level down as "<field>.<key>", since those are the values that get loaded as columns. A key
+    seen only empty still gets a 0, so it shows in the counts like an empty top-level field.
+    """
+    for field, value in record.items():
+        if not _has_value(value):
+            continue
+        counter[field] += 1
+        nested = _as_object(value)
+        if nested:
+            for key, inner in nested.items():
+                counter[f"{field}.{key}"] += 1 if _has_value(inner) else 0

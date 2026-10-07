@@ -147,3 +147,107 @@ def test_process_endofpipe_calls_emit_after_drain(monkeypatch):
         target._process_endofpipe()
 
     assert call_order == ["drain", "emit"]
+
+
+def test_count_filled_fields_skips_none_and_empty_strings():
+    """None, "" and blank strings are empty; 0, False and other values count as filled."""
+    from collections import Counter
+
+    from target_s3.sinks import count_filled_fields
+
+    counter: Counter = Counter()
+    count_filled_fields(counter, {"a": "x", "b": None, "c": "", "d": 0, "e": False, "f": "  "})
+    count_filled_fields(counter, {"a": "y", "b": "z"})
+    assert counter == {"a": 2, "b": 1, "d": 1, "e": 1}
+
+
+def test_count_filled_fields_counts_keys_inside_json_columns():
+    """A JSON object column (dict or JSON text) also counts its keys one level down, empty ones as 0."""
+    from collections import Counter
+
+    from target_s3.sinks import count_filled_fields
+
+    counter: Counter = Counter()
+    count_filled_fields(
+        counter,
+        {
+            "EVENT_PROPERTIES": '{"CONTEXT_PAGE_URL": "https://x", "CONTEXT_PAGE_TITLE": null}',
+            "META": {"K": "v", "EMPTY": " "},
+            "NOTE": "{not json",
+        },
+    )
+    assert counter == {
+        "EVENT_PROPERTIES": 1,
+        "EVENT_PROPERTIES.CONTEXT_PAGE_URL": 1,
+        "EVENT_PROPERTIES.CONTEXT_PAGE_TITLE": 0,
+        "META": 1,
+        "META.K": 1,
+        "META.EMPTY": 0,
+        "NOTE": 1,
+    }
+    assert "EVENT_PROPERTIES.CONTEXT_PAGE_TITLE" in counter  # 0 is kept, not dropped
+
+
+def test_emit_manifest_adds_filled_by_stream_when_counted(monkeypatch, tmp_path):
+    """Streams with a filled-field counter (track_filled_fields on) add filled_by_stream."""
+    from collections import Counter
+
+    manifest_path = tmp_path / "manifest.json"
+    monkeypatch.setenv(EXTRACTION_MANIFEST_S3_URI_ENV, str(manifest_path))
+
+    target = _make_target()
+    target._sinks_active = {"events": _fake_sink(3)}
+    target._filled_by_stream = {"events": Counter({"context_page_url": 2, "EVENT_ID": 3})}
+
+    target._emit_extraction_manifest()
+
+    written = json.loads(manifest_path.read_text())
+    assert written["filled_by_stream"] == {"events": {"context_page_url": 2, "EVENT_ID": 3}}
+
+
+def test_emit_manifest_has_no_filled_by_stream_when_off(monkeypatch, tmp_path):
+    """With track_filled_fields off (no counters), the manifest stays as before."""
+    manifest_path = tmp_path / "manifest.json"
+    monkeypatch.setenv(EXTRACTION_MANIFEST_S3_URI_ENV, str(manifest_path))
+
+    target = _make_target()
+    target._sinks_active = {"events": _fake_sink(3)}
+
+    target._emit_extraction_manifest()
+
+    assert "filled_by_stream" not in json.loads(manifest_path.read_text())
+
+
+def test_sink_starts_every_schema_field_at_zero():
+    """With track_filled_fields on, a schema field that never gets a value is reported as 0."""
+    from target_s3.sinks import s3Sink
+
+    target = Targets3(config={**SAMPLE_CONFIG, "track_filled_fields": True})
+    schema = {"properties": {"id": {"type": ["string"]}, "url": {"type": ["string", "null"]}}}
+    sink = s3Sink(target, "events", schema, ["id"])
+    sink.process_record({"id": "1", "url": ""}, {"records": []})
+    assert dict(sink._filled_by_field) == {"id": 1, "url": 0}
+
+
+def test_counts_survive_sink_replacement():
+    """A new sink for the same stream (new SCHEMA mid-run) keeps adding to the same counts."""
+    from target_s3.sinks import s3Sink
+
+    target = Targets3(config={**SAMPLE_CONFIG, "track_filled_fields": True})
+    first = s3Sink(target, "events", {"properties": {"id": {"type": ["string"]}}}, ["id"])
+    first.process_record({"id": "1"}, {"records": []})
+    schema2 = {"properties": {"id": {"type": ["string"]}, "url": {"type": ["string", "null"]}}}
+    second = s3Sink(target, "events", schema2, ["id"])
+    second.process_record({"id": "2", "url": "https://x"}, {"records": []})
+    assert dict(target._filled_by_stream["events"]) == {"id": 2, "url": 1}
+
+
+def test_sink_does_not_count_when_off():
+    """With track_filled_fields off, the sink keeps no counter."""
+    from target_s3.sinks import s3Sink
+
+    target = _make_target()
+    sink = s3Sink(target, "events", {"properties": {"id": {"type": ["string"]}}}, ["id"])
+    sink.process_record({"id": "1"}, {"records": []})
+    assert sink._filled_by_field is None
+    assert target._filled_by_stream == {}
