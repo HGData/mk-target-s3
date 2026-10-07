@@ -143,7 +143,8 @@ def count_filled_fields(counter: Counter, record: dict) -> None:
     """Add one to each field of the record that has a value.
 
     A field holding an object, or JSON text of one (an S3 json column), also counts its keys one
-    level down as "<field>.<key>", since those are the values that get loaded as columns.
+    level down as "<field>.<key>", since those are the values that get loaded as columns. A key
+    seen only empty still gets a 0, so it shows in the counts like an empty top-level field.
     """
     for field, value in record.items():
         if not _has_value(value):
@@ -152,5 +153,4 @@ def count_filled_fields(counter: Counter, record: dict) -> None:
         nested = _as_object(value)
         if nested:
             for key, inner in nested.items():
-                if _has_value(inner):
-                    counter[f"{field}.{key}"] += 1
+                counter[f"{field}.{key}"] += 1 if _has_value(inner) else 0

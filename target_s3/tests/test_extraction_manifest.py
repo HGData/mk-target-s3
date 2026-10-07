@@ -162,7 +162,7 @@ def test_count_filled_fields_skips_none_and_empty_strings():
 
 
 def test_count_filled_fields_counts_keys_inside_json_columns():
-    """A JSON object column (dict or JSON text) also counts its keys one level down."""
+    """A JSON object column (dict or JSON text) also counts its keys one level down, empty ones as 0."""
     from collections import Counter
 
     from target_s3.sinks import count_filled_fields
@@ -179,10 +179,13 @@ def test_count_filled_fields_counts_keys_inside_json_columns():
     assert counter == {
         "EVENT_PROPERTIES": 1,
         "EVENT_PROPERTIES.CONTEXT_PAGE_URL": 1,
+        "EVENT_PROPERTIES.CONTEXT_PAGE_TITLE": 0,
         "META": 1,
         "META.K": 1,
+        "META.EMPTY": 0,
         "NOTE": 1,
     }
+    assert "EVENT_PROPERTIES.CONTEXT_PAGE_TITLE" in counter  # 0 is kept, not dropped
 
 
 def test_emit_manifest_adds_filled_by_stream_when_counted(monkeypatch, tmp_path):
