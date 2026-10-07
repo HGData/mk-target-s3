@@ -1,6 +1,7 @@
 """s3 target sink class, which handles writing streams."""
 
 from __future__ import annotations
+import json
 import logging
 from collections import Counter
 
@@ -37,12 +38,11 @@ class s3Sink(BatchSink):
         # to build the ingestion descriptor (which partitions of this stream landed, and where).
         self._written_keys: set[str] = set()
         # Rows with a value per field, for the manifest. None when track_filled_fields is off.
-        # Every schema field starts at 0, so a field that is empty in this run shows as 0, not missing.
+        # Held by the target per stream, so a sink the SDK replaces mid-run keeps counting into the
+        # same counter. Every schema field starts at 0, so an empty field shows as 0, not missing.
         self._filled_by_field: Counter | None = None
         if self.config.get("track_filled_fields", False):
-            self._filled_by_field = Counter(
-                {field: 0 for field in (schema or {}).get("properties", {})}
-            )
+            self._filled_by_field = target.filled_counter(stream_name, schema)
         if self.format_type:
             if self.format_type not in FORMAT_TYPE:
                 raise Exception(
@@ -117,8 +117,40 @@ class s3Sink(BatchSink):
             self._written_keys.add(written_key)
 
 
+def _has_value(value) -> bool:
+    """None, "" and blank strings count as empty, like BLANKSASNULL in the legacy loads."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    return True
+
+
+def _as_object(value):
+    """Return the value as a dict when it is one, or JSON text of one; otherwise None."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.lstrip().startswith("{"):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
 def count_filled_fields(counter: Counter, record: dict) -> None:
-    """Add one to each top-level field of the record that has a value. None and "" count as empty."""
+    """Add one to each field of the record that has a value.
+
+    A field holding an object, or JSON text of one (an S3 json column), also counts its keys one
+    level down as "<field>.<key>", since those are the values that get loaded as columns.
+    """
     for field, value in record.items():
-        if value is not None and value != "":
-            counter[field] += 1
+        if not _has_value(value):
+            continue
+        counter[field] += 1
+        nested = _as_object(value)
+        if nested:
+            for key, inner in nested.items():
+                if _has_value(inner):
+                    counter[f"{field}.{key}"] += 1
