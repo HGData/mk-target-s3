@@ -248,6 +248,14 @@ class Targets3(Target):
             default=False,
         ),
         th.Property(
+            "validate_records",
+            th.BooleanType,
+            description="Check every record against the stream schema before it is written. Turn it off where "
+            "every column lands as text and dbt shapes it later (s3): the check changes nothing there and takes "
+            "about half of the target's time.",
+            default=True,
+        ),
+        th.Property(
             "dynamic_dt",
             th.BooleanType,
             description="Enable dynamic dt generation for each batch. When enabled, any 'dt=' entries in partition_by will use the current batch timestamp instead of static environment variables.",
