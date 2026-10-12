@@ -83,6 +83,12 @@ class s3Sink(BatchSink):
         """
         return self.config.get("max_batch_size", 10000)
 
+    def _validate_and_parse(self, record: dict) -> dict:
+        """Check the record against the schema, unless validate_records is off."""
+        if self.config.get("validate_records", True):
+            return super()._validate_and_parse(record)
+        return record
+
     def process_record(self, record: dict, context: dict) -> None:
         """Count the fields that have a value, then queue the record as usual."""
         if self._filled_by_field is not None:
