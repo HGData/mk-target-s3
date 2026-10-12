@@ -171,6 +171,18 @@ class Targets3(Target):
             default=False,
         ),
         th.Property(
+            "descriptor_stream_names",
+            th.ObjectType(),
+            description=(
+                "Optional map of raw Singer stream name to the canonical stream name to publish in the "
+                "ingestion descriptor. A warehouse connector lands its tenant's own '{dataset}-{table}' "
+                "stream, while the Iceberg pipeline keys on a canonical token; this renames only the "
+                "descriptor's stream field, leaving the S3 layout and every other output as sent. Empty "
+                "(the default) publishes each stream name unchanged."
+            ),
+            default={},
+        ),
+        th.Property(
             "append_date_to_prefix",
             th.BooleanType,
             description="A flag to append the date to the key prefix.",
@@ -361,6 +373,14 @@ class Targets3(Target):
             return
 
         extracted_at = datetime.now(tz=timezone.utc).isoformat()
+        # The descriptor names the canonical stream the Iceberg pipeline keys on, which a warehouse
+        # connector's raw '{dataset}-{table}' stream is not; this map renames only that field, so the S3
+        # locations below still come from the keys the batches actually wrote. Meltano may hand an object
+        # setting over as a JSON string when it is set from an env var, so a string is parsed rather than
+        # trusted to be a dict.
+        stream_names = self.config.get("descriptor_stream_names") or {}
+        if isinstance(stream_names, str):
+            stream_names = json.loads(stream_names) if stream_names.strip() else {}
         streams = []
         for stream_name, sink in self._sinks_active.items():
             written_keys = getattr(sink, "_written_keys", None) or set()
@@ -391,7 +411,7 @@ class Targets3(Target):
             ]
             streams.append(
                 {
-                    "stream": stream_name,
+                    "stream": stream_names.get(stream_name, stream_name),
                     "table_root": table_root,
                     "partition_keys": [{"name": "dt", "type": "string"}],
                     "arrivals": arrivals,

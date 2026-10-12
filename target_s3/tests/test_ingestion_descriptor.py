@@ -131,6 +131,44 @@ def test_stream_without_dt_partition_is_omitted(monkeypatch, tmp_path):
     assert json.loads(path.read_text())["streams"] == []
 
 
+_BQ_ROOT = "test-bucket/data/tenants/objects/6096_dbt-full_path_contact_madkudu/source_system=bigquery/tenant=6096"
+
+
+def test_descriptor_stream_names_renames_only_the_stream_field(monkeypatch, tmp_path):
+    """The map renames the published stream to its canonical token; the S3 locations stay the raw ones.
+
+    A warehouse connector lands its tenant's own '{dataset}-{table}' stream, which the Iceberg pipeline
+    cannot resolve to a transform spec; the map publishes the canonical token instead, while table_root and
+    the arrival location still come from the keys the batch wrote.
+    """
+    path = tmp_path / "descriptor.json"
+    monkeypatch.setenv(INGESTION_DESCRIPTOR_S3_URI_ENV, str(path))
+    config = {**SAMPLE_CONFIG, "descriptor_stream_names": {"dbt-full_path_contact_madkudu": "contact_update"}}
+    target = Targets3(config=config)
+    target._sinks_active = {
+        "dbt-full_path_contact_madkudu": _fake_sink(_SCHEMA, [f"{_BQ_ROOT}/dt=2026-10-09-13-45/f.jsonl.gz"])
+    }
+
+    target._emit_ingestion_descriptor()
+
+    stream = json.loads(path.read_text())["streams"][0]
+    assert stream["stream"] == "contact_update"
+    assert stream["table_root"] == f"s3://{_BQ_ROOT}/"
+    assert stream["arrivals"][0]["partition"]["location"] == f"s3://{_BQ_ROOT}/dt=2026-10-09-13-45/"
+
+
+def test_descriptor_stream_names_leaves_unmapped_streams_unchanged(monkeypatch, tmp_path):
+    """A stream the map does not name keeps its own name, so the map is safe to set for every connector."""
+    path = tmp_path / "descriptor.json"
+    monkeypatch.setenv(INGESTION_DESCRIPTOR_S3_URI_ENV, str(path))
+    config = {**SAMPLE_CONFIG, "descriptor_stream_names": {"something-else": "mapped"}}
+    target = Targets3(config=config)
+    target._sinks_active = {"Account": _fake_sink(_SCHEMA, [f"{_ROOT}/dt=2026-08-26-14-15/f.jsonl.gz"])}
+
+    target._emit_ingestion_descriptor()
+    assert json.loads(path.read_text())["streams"][0]["stream"] == "Account"
+
+
 def test_process_endofpipe_swallows_descriptor_errors(monkeypatch):
     """Descriptor emission errors must NEVER propagate out of _process_endofpipe."""
     monkeypatch.setenv(INGESTION_DESCRIPTOR_S3_URI_ENV, "s3://broken/uri")
