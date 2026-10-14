@@ -259,9 +259,11 @@ class Targets3(Target):
         th.Property(
             "validate_records",
             th.BooleanType,
-            description="Check every record against the stream schema before it is written. Turn it off where "
-            "every column lands as text and dbt shapes it later (s3): the check changes nothing there and takes "
-            "about half of the target's time.",
+            description="Check every record against the stream schema, and parse its date-time fields, before it "
+            "is written. Off, records are written exactly as the tap sent them: no schema check, and date-time "
+            "values keep their original text (bad dates are not nulled). Turn it off only where every column lands "
+            "as text and dbt shapes it later (s3, which has no date-time fields): there it changes nothing and "
+            "takes about half of the target's time.",
             default=True,
         ),
         th.Property(
