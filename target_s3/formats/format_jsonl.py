@@ -40,12 +40,13 @@ class FormatJsonl(FormatBase):
         pass
 
     def _prepare_records(self):
-        # Sanitize UTF-8 surrogates from all records
-        self.records = [self.sanitize_utf8(record) for record in self.records]
+        # UTF-8 surrogates are removed per record while writing (see _write), so no second copy of the batch is kept.
         return super()._prepare_records()
 
     def _write(self) -> None:
-        return super()._write('\n'.join(json.dumps(r, cls=JsonSerialize) for r in self.records))
+        return super()._write_lines(
+            lambda: (json.dumps(self.sanitize_utf8(r), cls=JsonSerialize) for r in self.records)
+        )
 
     def run(self) -> None:
         # use default behavior, no additional run steps needed

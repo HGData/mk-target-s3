@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime
 from abc import ABCMeta, abstractmethod
 
@@ -20,6 +21,8 @@ DATE_GRAIN = {
     "microsecond": 1,
 }
 COMPRESSION = {}
+# UTF-16 surrogate code points, which Redshift does not accept.
+SURROGATES = re.compile("[\ud800-\udfff]")
 
 
 def format_type_factory(object_type_class, *pargs, **kargs):
@@ -94,6 +97,13 @@ class FormatBase(metaclass=ABCMeta):
     @abstractmethod
     def _write(self, contents: str = None) -> None:
         """Execute the write to S3 with retry on transient S3 errors."""
+        self._write_lines(lambda: iter([contents]))
+
+    def _write_lines(self, lines) -> None:
+        """Write lines to S3 one by one, joined by new lines, so the whole file is never held as one string.
+
+        :param lines: function returning a fresh iterator of lines, so a retry writes the file again from the start
+        """
 
         @backoff.on_exception(
             backoff.expo,
@@ -112,7 +122,10 @@ class FormatBase(metaclass=ABCMeta):
                 "w",
                 transport_params={"client": self.client},
             ) as f:
-                f.write(contents)
+                for number, line in enumerate(lines()):
+                    if number:
+                        f.write("\n")
+                    f.write(line)
 
         _write_with_retry()
 
@@ -131,7 +144,11 @@ class FormatBase(metaclass=ABCMeta):
         :param s: Input string potentially containing surrogates
         :return: String with surrogates removed
         """
-        return "".join(ch for ch in s if not (0xD800 <= ord(ch) <= 0xDFFF))
+        # Most values are plain ASCII and cannot hold a surrogate; checking every character in Python
+        # was over half of target-s3's time on large S3 files.
+        if s.isascii():
+            return s
+        return SURROGATES.sub("", s)
 
     def sanitize_utf8(self, obj):
         """Sanitise strings and those in nested data structures
