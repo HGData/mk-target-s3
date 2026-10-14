@@ -5,6 +5,8 @@ import decimal
 import json
 import logging
 import os
+import resource
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -321,6 +323,9 @@ class Targets3(Target):
         fail-open on.
         """
         super()._process_endofpipe()
+        # ru_maxrss is in KB on Linux (bytes on macOS). Shows how close a run came to the task's memory.
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024 if sys.platform == "darwin" else 1024)
+        LOGGER.info("target-s3 peak memory: %d MB", peak)
         try:
             self._emit_extraction_manifest()
         except Exception as exc:  # noqa: BLE001 — must never raise here
