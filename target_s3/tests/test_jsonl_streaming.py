@@ -3,6 +3,7 @@ batch, no single big string, and a retry writes the whole file again."""
 
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import logging
@@ -53,33 +54,37 @@ def old_file(records) -> str:
 
 
 class FakeS3:
-    """Stands in for smart_open: keeps what each attempt wrote, and can fail the first attempt part-way."""
+    """Stands in for smart_open's raw S3 writer: keeps what each attempt wrote, aborts (None) on an error like
+    the real writer, and can fail the first attempt part-way."""
 
     def __init__(self, fail_first_after_lines: int | None = None):
-        self.files, self.fail_after = [], fail_first_after_lines
+        self.files, self.keys, self.fail_after = [], [], fail_first_after_lines
 
-    def open(self, path, mode="w", transport_params=None):
+    def open(self, path, mode="wb", compression=None, transport_params=None):
         fake = self
+        assert mode == "wb" and compression == "disable"
 
-        class Handle(io.StringIO):
-            def write(self, text):
-                if fake.fail_after is not None and len(fake.files) == 1 and self.getvalue().count("\n") >= fake.fail_after:
+        class Handle(io.BytesIO):
+            def write(self, data):
+                if fake.fail_after is not None and len(fake.files) == 1 and self.getvalue().count(b"\n") >= fake.fail_after:
                     fake.fail_after = None
                     raise ClientError({"Error": {"Code": "SlowDown", "Message": "reduce your request rate"}}, "UploadPart")
-                return super().write(text)
+                return super().write(data)
 
-            def __exit__(self, *exc):
-                fake.files[-1] = self.getvalue()
+            def __exit__(self, exc_type, *exc):
+                data = self.getvalue()
+                fake.files[-1] = None if exc_type else (gzip.decompress(data) if path.endswith(".gz") else data).decode()
                 return False
 
         self.files.append(None)
+        self.keys.append(path)
         return Handle()
 
 
-def run_writer(monkeypatch, records, fake):
+def run_writer(monkeypatch, records, fake, config=CONFIG):
     monkeypatch.setattr(format_base, "open", fake.open)
     context = {"stream_name": "events", "batch_start_time": None, "logger": logging.getLogger("t"), "records": records}
-    writer = FormatJsonl(CONFIG, context)
+    writer = FormatJsonl(config, context)
     writer.run()
     return writer
 
@@ -113,5 +118,19 @@ def test_a_retry_writes_the_whole_file_again(monkeypatch):
     fake = FakeS3(fail_first_after_lines=20)
     monkeypatch.setattr(format_base.backoff, "full_jitter", lambda value: 0)
     run_writer(monkeypatch, many, fake)
-    assert len(fake.files) == 2
-    assert fake.files[-1] == old_file(many)
+    assert fake.files == [None, old_file(many)]  # the failed attempt was aborted, not saved part-way
+
+
+def test_an_error_while_building_a_line_leaves_no_file(monkeypatch):
+    fake = FakeS3()
+    with pytest.raises(TypeError):
+        run_writer(monkeypatch, RECORDS + [{("not", "text"): 1}], fake)  # json.dumps rejects a tuple key
+    assert fake.files == [None]
+
+
+def test_a_gz_key_is_gzipped_and_the_same_as_before(monkeypatch):
+    fake = FakeS3()
+    config = {**CONFIG, "use_raw_stream_name": False, "append_date_to_prefix": False, "append_date_to_filename": False}
+    run_writer(monkeypatch, RECORDS, fake, config)
+    assert fake.keys[0].endswith(".jsonl.gz")
+    assert fake.files == [old_file(RECORDS)]

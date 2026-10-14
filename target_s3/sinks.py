@@ -84,7 +84,7 @@ class s3Sink(BatchSink):
         return self.config.get("max_batch_size", 10000)
 
     def _validate_and_parse(self, record: dict) -> dict:
-        """Check the record against the schema, unless validate_records is off."""
+        """Check the record against the schema and parse its date-time fields, unless validate_records is off."""
         if self.config.get("validate_records", True):
             return super()._validate_and_parse(record)
         return record
