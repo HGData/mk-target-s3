@@ -230,6 +230,13 @@ class Targets3(Target):
             default=10000,
         ),
         th.Property(
+            "max_buffer_mb",
+            th.IntegerType,
+            description="When the batches of all streams together hold more than this many MB of input JSON, "
+            "write out the largest batch early. Python needs about 2 to 3 times this in memory. Off when not set.",
+            required=False,
+        ),
+        th.Property(
             "partition_by",
             th.ArrayType(th.StringType),
             required=False,
@@ -269,6 +276,8 @@ class Targets3(Target):
         # Filled-field counts per stream (track_filled_fields). Kept here, not on the sink, so a sink
         # the SDK replaces mid-run (a new SCHEMA message) keeps adding to the same counts.
         self._filled_by_stream: dict[str, Counter] = {}
+        # Size in bytes of the last input line read (see deserialize_json).
+        self._record_bytes = 0
         super().__init__(*args, **kwargs)
         # Captured at target instantiation. The Singer SDK runs the target
         # for the duration of one tap+target invocation, so this is a good
@@ -278,6 +287,28 @@ class Targets3(Target):
     @property
     def _MAX_RECORD_AGE_IN_MINUTES(self) -> float:  # type: ignore
         return float(self.config.get("max_batch_age", 5.0))
+
+    def _process_record_message(self, message_dict: dict) -> None:
+        """Queue the record as usual, then write out the largest batch if all batches hold too much.
+
+        max_batch_size only counts records, so wide rows (500 Salesforce fields) or many streams filling at
+        once can pass the task's memory before any batch is full.
+        """
+        sink = self._sinks_active.get(message_dict.get("stream"))
+        if sink is not None:
+            sink.buffered_bytes += self._record_bytes
+        super()._process_record_message(message_dict)
+        limit_mb = self.config.get("max_buffer_mb")
+        if not limit_mb:
+            return
+        sinks = list(self._sinks_active.values())
+        if sum(s.buffered_bytes for s in sinks) > limit_mb * 1024 * 1024:
+            largest = max(sinks, key=lambda s: s.buffered_bytes)
+            self.logger.info(
+                "Batches hold more than max_buffer_mb (%d MB). Draining the largest, '%s' (%d records)...",
+                limit_mb, largest.stream_name, largest.current_size,
+            )
+            self.drain_one(largest)
 
     def _process_endofpipe(self) -> None:
         """Override the SDK lifecycle hook to emit a manifest after final drain.
@@ -496,6 +527,8 @@ class Targets3(Target):
         :return: deserialized record
         :rtype: dict
         """
+        # Size of the line, so _process_record_message can count the JSON bytes each batch holds.
+        self._record_bytes = len(line)
         try:
             self.format = self.config.get("format", None)
             format_parquet = self.format.get("format_parquet", None)

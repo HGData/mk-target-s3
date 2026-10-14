@@ -3,6 +3,7 @@
 from __future__ import annotations
 import json
 import logging
+import sys
 from collections import Counter
 
 from boto3 import Session
@@ -41,6 +42,9 @@ class s3Sink(BatchSink):
         # Held by the target per stream, so a sink the SDK replaces mid-run keeps counting into the
         # same counter. Every schema field starts at 0, so an empty field shows as 0, not missing.
         self._filled_by_field: Counter | None = None
+        # Input JSON bytes of the records waiting in the current batch. The target adds to it per record
+        # and drains the largest batch when all batches together pass max_buffer_mb.
+        self.buffered_bytes = 0
         if self.config.get("track_filled_fields", False):
             self._filled_by_field = target.filled_counter(stream_name, schema)
         if self.format_type:
@@ -93,10 +97,14 @@ class s3Sink(BatchSink):
         """Count the fields that have a value, then queue the record as usual."""
         if self._filled_by_field is not None:
             count_filled_fields(self._filled_by_field, record)
+        # json.loads makes new key strings for every record. With hundreds of fields (Salesforce) those keys
+        # take more memory than the values, so every queued record shares one copy of each field name.
+        record = {sys.intern(key): value for key, value in record.items()}
         super().process_record(record, context)
 
     def process_batch(self, context: dict) -> None:
         """Write out any prepped records and return once fully written."""
+        self.buffered_bytes = 0
         # add stream name to context
         context["stream_name"] = self.stream_name
         context["logger"] = self.logger
