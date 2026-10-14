@@ -40,9 +40,10 @@ def lines(*messages) -> io.StringIO:
     return io.StringIO("".join(json.dumps(m) + "\n" for m in messages))
 
 
-def schema(stream):
-    return {"type": "SCHEMA", "stream": stream, "key_properties": ["id"],
-            "schema": {"type": "object", "properties": {"id": {"type": "integer"}, "text": {"type": ["null", "string"]}}}}
+def schema(stream, *extra):
+    properties = {"id": {"type": "integer"}, "text": {"type": ["null", "string"]}}
+    properties.update({name: {"type": ["null", "string"]} for name in extra})
+    return {"type": "SCHEMA", "stream": stream, "key_properties": ["id"], "schema": {"type": "object", "properties": properties}}
 
 
 def record(stream, i, text="small"):
@@ -92,3 +93,12 @@ def test_a_full_batch_still_resets_the_count(written):
     target = run({"max_batch_size": 2}, schema("Lead"), record("Lead", 1), record("Lead", 2), record("Lead", 3))
     assert written == [("Lead", 2)]
     assert 0 < target._sinks_active["Lead"].buffered_bytes < 100
+
+
+def test_a_batch_parked_by_a_new_schema_counts_and_is_written_first(written):
+    # The S3 tap sends the schema again when new columns appear; the SDK parks the old sink until a full drain.
+    messages = [schema("Lead")] + [record("Lead", i, WIDE_VALUE) for i in range(6)]
+    messages += [schema("Lead", "new_column")] + [record("Lead", i, WIDE_VALUE) for i in range(6, 11)]
+    target = run({"max_buffer_mb": 1}, *messages)
+    assert written == [("Lead", 6)]  # the parked batch, not the 5 newer records
+    assert target._sinks_active["Lead"].current_size == 5

@@ -305,9 +305,12 @@ class Targets3(Target):
         limit_mb = self.config.get("max_buffer_mb")
         if not limit_mb:
             return
-        sinks = list(self._sinks_active.values())
-        if sum(s.buffered_bytes for s in sinks) > limit_mb * 1024 * 1024:
-            largest = max(sinks, key=lambda s: s.buffered_bytes)
+        # A new SCHEMA for a stream (the S3 tap sends one when new columns appear) parks the old sink, with its
+        # queued records, until the next full drain. Count those too, and write them first, as drain_all does.
+        parked = [s for s in self._sinks_to_clear if s.current_size]
+        active = list(self._sinks_active.values())
+        if sum(s.buffered_bytes for s in parked + active) > limit_mb * 1024 * 1024:
+            largest = max(parked or active, key=lambda s: s.buffered_bytes)
             self.logger.info(
                 "Batches hold more than max_buffer_mb (%d MB). Draining the largest, '%s' (%d records)...",
                 limit_mb, largest.stream_name, largest.current_size,
