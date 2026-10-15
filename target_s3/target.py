@@ -529,8 +529,11 @@ class Targets3(Target):
         )
 
     def deserialize_json(self, line: str) -> dict:
-        """Override base target's method to overcome Decimal cast,
-        only applied when generating parquet schema from tap schema.
+        """Override base target's method to read decimals as Decimal only where a later step needs it.
+
+        Parquet (without get_schema_from_tap) builds its column types from the values, so it keeps Decimal.
+        The JSON writers turn every Decimal back into a float when they write, so for them Decimal only cost
+        memory and time; plain floats give the same output (RGI-3169).
 
         :param line: serialized record from stream
         :type line: str
@@ -541,13 +544,10 @@ class Targets3(Target):
         self._record_bytes = len(line)
         try:
             self.format = self.config.get("format", None)
-            format_parquet = self.format.get("format_parquet", None)
-            if format_parquet and format_parquet.get("get_schema_from_tap", False):
-                return json.loads(line)  # type: ignore[no-any-return]
-            else:
-                return json.loads(  # type: ignore[no-any-return]
-                    line, parse_float=decimal.Decimal
-                )
+            format_parquet = self.format.get("format_parquet", None) or {}
+            if self.format.get("format_type") == "parquet" and not format_parquet.get("get_schema_from_tap", False):
+                return json.loads(line, parse_float=decimal.Decimal)  # type: ignore[no-any-return]
+            return json.loads(line)  # type: ignore[no-any-return]
         except json.decoder.JSONDecodeError as exc:
             self.logger.error("Unable to parse:\n%s", line, exc_info=exc)
             raise
