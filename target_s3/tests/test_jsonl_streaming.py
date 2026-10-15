@@ -106,6 +106,12 @@ def test_the_batch_is_not_copied(monkeypatch):
     assert writer.records is writer.context["records"]
 
 
+def test_surrogates_in_keys_are_removed_too(monkeypatch):
+    fake = FakeS3()
+    run_writer(monkeypatch, [{"event_key": "1", "props": {"ti" + S + "tle": "x", "ok": "y"}}], fake)
+    assert json.loads(fake.files[0]) == {"event_key": "1", "props": {"title": "x", "ok": "y"}}
+
+
 def test_one_record_and_no_record(monkeypatch):
     for records in (RECORDS[:1], []):
         fake = FakeS3()
