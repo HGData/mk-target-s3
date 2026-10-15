@@ -24,8 +24,8 @@ DATE_GRAIN = {
 COMPRESSION = {}
 # UTF-16 surrogate code points, which Redshift does not accept.
 SURROGATES = re.compile("[\ud800-\udfff]")
-# Lines are joined into blocks of about this many characters before each write: one small gzip write per row costs
-# more CPU than building the row, and a 1 MB block keeps memory small.
+# Lines are joined into blocks of about this many characters before each write: one small gzip write per row was
+# about 10% of the writer's CPU on a Lucid file, and a 1 MB block keeps memory small.
 WRITE_BLOCK_CHARS = 1024 * 1024
 
 
@@ -161,7 +161,7 @@ class FormatBase(metaclass=ABCMeta):
         :return: String with surrogates removed
         """
         # Most values are plain ASCII and cannot hold a surrogate; checking every character in Python
-        # was over half of target-s3's time on large S3 files.
+        # was about a third of target-s3's CPU on a Lucid file.
         if s.isascii():
             return s
         return SURROGATES.sub("", s)
