@@ -5,9 +5,15 @@ import decimal
 import json
 import logging
 import os
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+
+try:
+    import resource  # Unix only; the peak memory line is skipped without it
+except ImportError:  # pragma: no cover
+    resource = None
 
 from boto3 import Session
 from singer_sdk.target_base import Target
@@ -230,6 +236,15 @@ class Targets3(Target):
             default=10000,
         ),
         th.Property(
+            "max_buffer_mb",
+            th.IntegerType,
+            description="When the batches of all streams together hold more than this many MB of input JSON "
+            "(counted in characters), write out the largest batch early. Python needs more than this in memory (measured "
+            "about 1.2 to 2 times for wide rows, about 4.5 times for narrow rows), so for narrow rows max_batch_size is "
+            "what bounds a batch. Off when not set or below 1.",
+            required=False,
+        ),
+        th.Property(
             "partition_by",
             th.ArrayType(th.StringType),
             required=False,
@@ -271,6 +286,9 @@ class Targets3(Target):
         # Filled-field counts per stream (track_filled_fields). Kept here, not on the sink, so a sink
         # the SDK replaces mid-run (a new SCHEMA message) keeps adding to the same counts.
         self._filled_by_stream: dict[str, Counter] = {}
+        # Length in characters of the last input line read (see deserialize_json); the sink that queues the
+        # record adds it to its batch size for max_buffer_mb.
+        self.last_line_chars = 0
         super().__init__(*args, **kwargs)
         # Captured at target instantiation. The Singer SDK runs the target
         # for the duration of one tap+target invocation, so this is a good
@@ -280,6 +298,28 @@ class Targets3(Target):
     @property
     def _MAX_RECORD_AGE_IN_MINUTES(self) -> float:  # type: ignore
         return float(self.config.get("max_batch_age", 5.0))
+
+    def _process_record_message(self, message_dict: dict) -> None:
+        """Queue the record as usual, then write out the largest batch if all batches hold too much.
+
+        max_batch_size only counts records, so wide rows (500 Salesforce fields) or many streams filling at
+        once can pass the task's memory before any batch is full.
+        """
+        super()._process_record_message(message_dict)
+        limit_mb = self.config.get("max_buffer_mb")
+        if not limit_mb or limit_mb < 1:  # not set, 0 or negative: off
+            return
+        # A new SCHEMA for a stream (the S3 tap sends one when new columns appear) parks the old sink, with its
+        # queued records, until the next full drain. Count those too, and write them first, as drain_all does.
+        parked = [s for s in self._sinks_to_clear if s.current_size]
+        active = list(self._sinks_active.values())
+        if sum(s.buffered_chars for s in parked + active) > limit_mb * 1024 * 1024:
+            largest = max(parked or active, key=lambda s: s.buffered_chars)
+            self.logger.info(
+                "Batches hold more than max_buffer_mb (%d MB). Draining the largest, '%s' (%d records)...",
+                limit_mb, largest.stream_name, largest.current_size,
+            )
+            self.drain_one(largest)
 
     def _process_endofpipe(self) -> None:
         """Override the SDK lifecycle hook to emit a manifest after final drain.
@@ -292,6 +332,11 @@ class Targets3(Target):
         fail-open on.
         """
         super()._process_endofpipe()
+        if resource is not None:
+            # Peak memory of this target process only; the tap and mapper are separate processes.
+            # ru_maxrss is in KB on Linux (bytes on macOS).
+            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024 if sys.platform == "darwin" else 1024)
+            LOGGER.info("target-s3 peak memory: %d MB", peak)
         try:
             self._emit_extraction_manifest()
         except Exception as exc:  # noqa: BLE001 — must never raise here
@@ -490,23 +535,25 @@ class Targets3(Target):
         )
 
     def deserialize_json(self, line: str) -> dict:
-        """Override base target's method to overcome Decimal cast,
-        only applied when generating parquet schema from tap schema.
+        """Override base target's method to read decimals as Decimal only where a later step needs it.
+
+        Parquet (without get_schema_from_tap) builds its column types from the values, so it keeps Decimal.
+        The JSON writers turn every Decimal back into a float when they write, so for them Decimal only cost
+        memory and time; plain floats give the same output (RGI-3169).
 
         :param line: serialized record from stream
         :type line: str
         :return: deserialized record
         :rtype: dict
         """
+        # Length of the line, so the sink that queues this record can count what its batch holds.
+        self.last_line_chars = len(line)
         try:
             self.format = self.config.get("format", None)
-            format_parquet = self.format.get("format_parquet", None)
-            if format_parquet and format_parquet.get("get_schema_from_tap", False):
-                return json.loads(line)  # type: ignore[no-any-return]
-            else:
-                return json.loads(  # type: ignore[no-any-return]
-                    line, parse_float=decimal.Decimal
-                )
+            format_parquet = self.format.get("format_parquet", None) or {}
+            if self.format.get("format_type") == "parquet" and not format_parquet.get("get_schema_from_tap", False):
+                return json.loads(line, parse_float=decimal.Decimal)  # type: ignore[no-any-return]
+            return json.loads(line)  # type: ignore[no-any-return]
         except json.decoder.JSONDecodeError as exc:
             self.logger.error("Unable to parse:\n%s", line, exc_info=exc)
             raise
