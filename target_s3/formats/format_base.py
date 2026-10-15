@@ -1,4 +1,3 @@
-import gzip
 import logging
 import re
 from datetime import datetime
@@ -121,28 +120,20 @@ class FormatBase(metaclass=ABCMeta):
             ),
         )
         def _write_with_retry():
-            # The file is still gzipped, by GzipFile below. compression="disable" only stops smart_open adding
-            # its own gzip layer, so this raw S3 writer stays the outer with block: an error part-way (S3 or
-            # building a line) cancels the upload and leaves no partial file. With smart_open's gzip on top,
-            # the upload was completed on close, even after an error.
             with open(
                 f"s3://{self.fully_qualified_key}",
-                "wb",
-                compression="disable",
+                "w",
                 transport_params={"client": self.client},
-            ) as raw:
-                out = gzip.GzipFile(fileobj=raw, mode="wb") if self.fully_qualified_key.endswith(".gz") else raw
+            ) as f:
                 block, size, sep = [], 0, ""
                 for line in lines():
                     block.append(line)
                     size += len(line)
                     if size >= WRITE_BLOCK_CHARS:
-                        out.write((sep + "\n".join(block)).encode("utf-8"))
+                        f.write(sep + "\n".join(block))
                         block, size, sep = [], 0, "\n"
                 if block:
-                    out.write((sep + "\n".join(block)).encode("utf-8"))
-                if out is not raw:
-                    out.close()  # writes the gzip trailer; raw stays open, GzipFile does not close a file it was given
+                    f.write(sep + "\n".join(block))
 
         _write_with_retry()
 
