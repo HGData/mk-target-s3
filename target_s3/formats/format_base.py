@@ -121,9 +121,10 @@ class FormatBase(metaclass=ABCMeta):
             ),
         )
         def _write_with_retry():
-            # The raw S3 writer is the with-target, so an error part-way (S3 or building a line) aborts the
-            # upload and leaves no partial file. With smart_open's own gzip and text layers the upload is
-            # completed on close, even after an error.
+            # The file is still gzipped, by GzipFile below. compression="disable" only stops smart_open adding
+            # its own gzip layer, so this raw S3 writer stays the outer with block: an error part-way (S3 or
+            # building a line) cancels the upload and leaves no partial file. With smart_open's gzip on top,
+            # the upload was completed on close, even after an error.
             with open(
                 f"s3://{self.fully_qualified_key}",
                 "wb",
@@ -171,13 +172,10 @@ class FormatBase(metaclass=ABCMeta):
         by removing UTF-8 surrogates (invalid Unicode scalars).
 
         :param obj: Object to sanitize (dict, list, str, or other)
-        :return: Sanitized object with surrogates removed from all strings, dict keys included
+        :return: Sanitized object with surrogates removed from all strings
         """
         if isinstance(obj, dict):
-            return {
-                (self.strip_utf8_surrogates(k) if isinstance(k, str) else k): self.sanitize_utf8(v)
-                for k, v in obj.items()
-            }
+            return {k: self.sanitize_utf8(v) for k, v in obj.items()}
         if isinstance(obj, list):
             return [self.sanitize_utf8(v) for v in obj]
         if isinstance(obj, str):
