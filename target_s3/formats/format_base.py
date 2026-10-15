@@ -163,10 +163,13 @@ class FormatBase(metaclass=ABCMeta):
         by removing UTF-8 surrogates (invalid Unicode scalars).
 
         :param obj: Object to sanitize (dict, list, str, or other)
-        :return: Sanitized object with surrogates removed from all strings
+        :return: Sanitized object with surrogates removed from all strings, dict keys included
         """
         if isinstance(obj, dict):
-            return {k: self.sanitize_utf8(v) for k, v in obj.items()}
+            return {
+                (self.strip_utf8_surrogates(k) if isinstance(k, str) else k): self.sanitize_utf8(v)
+                for k, v in obj.items()
+            }
         if isinstance(obj, list):
             return [self.sanitize_utf8(v) for v in obj]
         if isinstance(obj, str):
