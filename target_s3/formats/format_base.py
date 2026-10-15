@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime
 from abc import ABCMeta, abstractmethod
 
@@ -20,6 +21,11 @@ DATE_GRAIN = {
     "microsecond": 1,
 }
 COMPRESSION = {}
+# UTF-16 surrogate code points, which Redshift does not accept.
+SURROGATES = re.compile("[\ud800-\udfff]")
+# Lines are joined into blocks of about this many characters before each write: one small gzip write per row was
+# about 10% of the writer's CPU on a Lucid file, and a 1 MB block keeps memory small.
+WRITE_BLOCK_CHARS = 1024 * 1024
 
 
 def format_type_factory(object_type_class, *pargs, **kargs):
@@ -94,6 +100,13 @@ class FormatBase(metaclass=ABCMeta):
     @abstractmethod
     def _write(self, contents: str = None) -> None:
         """Execute the write to S3 with retry on transient S3 errors."""
+        self._write_lines(lambda: iter([contents]))
+
+    def _write_lines(self, lines) -> None:
+        """Write lines to S3 in blocks of about 1 MB, joined by new lines, so the whole file is never held as one string.
+
+        :param lines: function returning a fresh iterator of lines, so a retry writes the file again from the start
+        """
 
         @backoff.on_exception(
             backoff.expo,
@@ -112,7 +125,15 @@ class FormatBase(metaclass=ABCMeta):
                 "w",
                 transport_params={"client": self.client},
             ) as f:
-                f.write(contents)
+                block, size, sep = [], 0, ""
+                for line in lines():
+                    block.append(line)
+                    size += len(line)
+                    if size >= WRITE_BLOCK_CHARS:
+                        f.write(sep + "\n".join(block))
+                        block, size, sep = [], 0, "\n"
+                if block:
+                    f.write(sep + "\n".join(block))
 
         _write_with_retry()
 
@@ -131,7 +152,11 @@ class FormatBase(metaclass=ABCMeta):
         :param s: Input string potentially containing surrogates
         :return: String with surrogates removed
         """
-        return "".join(ch for ch in s if not (0xD800 <= ord(ch) <= 0xDFFF))
+        # Most values are plain ASCII and cannot hold a surrogate; checking every character in Python
+        # was about a third of target-s3's CPU on a Lucid file.
+        if s.isascii():
+            return s
+        return SURROGATES.sub("", s)
 
     def sanitize_utf8(self, obj):
         """Sanitise strings and those in nested data structures

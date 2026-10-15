@@ -248,6 +248,16 @@ class Targets3(Target):
             default=False,
         ),
         th.Property(
+            "validate_records",
+            th.BooleanType,
+            description="Check every record against the stream schema, and parse its date-time fields, before it "
+            "is written. Off, records are written exactly as the tap sent them: no schema check, and date-time "
+            "values keep their original text (bad dates are not nulled). Turn it off only where every column lands "
+            "as text and dbt shapes it later (s3, which has no date-time fields): there it changes nothing and "
+            "takes about half of the target's time.",
+            default=True,
+        ),
+        th.Property(
             "dynamic_dt",
             th.BooleanType,
             description="Enable dynamic dt generation for each batch. When enabled, any 'dt=' entries in partition_by will use the current batch timestamp instead of static environment variables.",
