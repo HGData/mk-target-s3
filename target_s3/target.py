@@ -239,8 +239,9 @@ class Targets3(Target):
             "max_buffer_mb",
             th.IntegerType,
             description="When the batches of all streams together hold more than this many MB of input JSON "
-            "(counted in characters), write out the largest batch early. Python needs a few times this in memory. "
-            "Off when not set.",
+            "(counted in characters), write out the largest batch early. Python needs more than this in memory (measured "
+            "about 1.2 to 2 times for wide rows, about 4.5 times for narrow rows), so for narrow rows max_batch_size is "
+            "what bounds a batch. Off when not set or below 1.",
             required=False,
         ),
         th.Property(
@@ -306,7 +307,7 @@ class Targets3(Target):
         """
         super()._process_record_message(message_dict)
         limit_mb = self.config.get("max_buffer_mb")
-        if not limit_mb:
+        if not limit_mb or limit_mb < 1:  # not set, 0 or negative: off
             return
         # A new SCHEMA for a stream (the S3 tap sends one when new columns appear) parks the old sink, with its
         # queued records, until the next full drain. Count those too, and write them first, as drain_all does.

@@ -112,3 +112,9 @@ def test_records_a_stream_map_drops_are_not_counted(written):
     assert target._sinks_active["User"].buffered_chars == 0
     assert target._sinks_active["User"].current_size == 0
     assert written == []
+
+
+@pytest.mark.parametrize("limit", [0, -128])
+def test_zero_or_negative_limit_is_off(written, limit):
+    run({"max_buffer_mb": limit}, schema("Lead"), *[record("Lead", i, WIDE_VALUE) for i in range(5)])
+    assert written == []
