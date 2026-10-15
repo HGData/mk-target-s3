@@ -123,6 +123,7 @@ def test_a_retry_writes_the_whole_file_again(monkeypatch):
     many = [{"event_key": str(i), "text": "row " + str(i) + S} for i in range(50)]
     fake = FakeS3(fail_first_after_lines=20)
     monkeypatch.setattr(format_base.backoff, "full_jitter", lambda value: 0)
+    monkeypatch.setattr(format_base, "WRITE_BLOCK_CHARS", 1)  # one line per write, so the failure lands part-way
     run_writer(monkeypatch, many, fake)
     assert fake.files == [None, old_file(many)]  # the failed attempt was aborted, not saved part-way
 
@@ -140,3 +141,12 @@ def test_a_gz_key_is_gzipped_and_the_same_as_before(monkeypatch):
     run_writer(monkeypatch, RECORDS, fake, config)
     assert fake.keys[0].endswith(".jsonl.gz")
     assert fake.files == [old_file(RECORDS)]
+
+
+@pytest.mark.parametrize("block_chars", [1, 50, 10_000_000])
+def test_the_file_is_the_same_for_any_block_size(monkeypatch, block_chars):
+    many = [{"event_key": str(i), "text": "row " + str(i) + S} for i in range(200)]
+    monkeypatch.setattr(format_base, "WRITE_BLOCK_CHARS", block_chars)
+    fake = FakeS3()
+    run_writer(monkeypatch, many, fake)
+    assert fake.files == [old_file(many)]

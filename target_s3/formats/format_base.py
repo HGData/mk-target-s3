@@ -24,6 +24,9 @@ DATE_GRAIN = {
 COMPRESSION = {}
 # UTF-16 surrogate code points, which Redshift does not accept.
 SURROGATES = re.compile("[\ud800-\udfff]")
+# Lines are joined into blocks of about this many characters before each write: one small gzip write per row costs
+# more CPU than building the row, and a 1 MB block keeps memory small.
+WRITE_BLOCK_CHARS = 1024 * 1024
 
 
 def format_type_factory(object_type_class, *pargs, **kargs):
@@ -101,7 +104,7 @@ class FormatBase(metaclass=ABCMeta):
         self._write_lines(lambda: iter([contents]))
 
     def _write_lines(self, lines) -> None:
-        """Write lines to S3 one by one, joined by new lines, so the whole file is never held as one string.
+        """Write lines to S3 in blocks of about 1 MB, joined by new lines, so the whole file is never held as one string.
 
         :param lines: function returning a fresh iterator of lines, so a retry writes the file again from the start
         """
@@ -128,10 +131,15 @@ class FormatBase(metaclass=ABCMeta):
                 transport_params={"client": self.client},
             ) as raw:
                 out = gzip.GzipFile(fileobj=raw, mode="wb") if self.fully_qualified_key.endswith(".gz") else raw
-                for number, line in enumerate(lines()):
-                    if number:
-                        out.write(b"\n")
-                    out.write(line.encode("utf-8"))
+                block, size, sep = [], 0, ""
+                for line in lines():
+                    block.append(line)
+                    size += len(line)
+                    if size >= WRITE_BLOCK_CHARS:
+                        out.write((sep + "\n".join(block)).encode("utf-8"))
+                        block, size, sep = [], 0, "\n"
+                if block:
+                    out.write((sep + "\n".join(block)).encode("utf-8"))
                 if out is not raw:
                     out.close()  # writes the gzip trailer; raw stays open, GzipFile does not close a file it was given
 
