@@ -5,11 +5,15 @@ import decimal
 import json
 import logging
 import os
-import resource
 import sys
 from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+
+try:
+    import resource  # Unix only; the peak memory line is skipped without it
+except ImportError:  # pragma: no cover
+    resource = None
 
 from boto3 import Session
 from singer_sdk.target_base import Target
@@ -234,8 +238,9 @@ class Targets3(Target):
         th.Property(
             "max_buffer_mb",
             th.IntegerType,
-            description="When the batches of all streams together hold more than this many MB of input JSON, "
-            "write out the largest batch early. Python needs about 2 to 3 times this in memory. Off when not set.",
+            description="When the batches of all streams together hold more than this many MB of input JSON "
+            "(counted in characters), write out the largest batch early. Python needs a few times this in memory. "
+            "Off when not set.",
             required=False,
         ),
         th.Property(
@@ -280,8 +285,9 @@ class Targets3(Target):
         # Filled-field counts per stream (track_filled_fields). Kept here, not on the sink, so a sink
         # the SDK replaces mid-run (a new SCHEMA message) keeps adding to the same counts.
         self._filled_by_stream: dict[str, Counter] = {}
-        # Size in bytes of the last input line read (see deserialize_json).
-        self._record_bytes = 0
+        # Length in characters of the last input line read (see deserialize_json); the sink that queues the
+        # record adds it to its batch size for max_buffer_mb.
+        self.last_line_chars = 0
         super().__init__(*args, **kwargs)
         # Captured at target instantiation. The Singer SDK runs the target
         # for the duration of one tap+target invocation, so this is a good
@@ -298,9 +304,6 @@ class Targets3(Target):
         max_batch_size only counts records, so wide rows (500 Salesforce fields) or many streams filling at
         once can pass the task's memory before any batch is full.
         """
-        sink = self._sinks_active.get(message_dict.get("stream"))
-        if sink is not None:
-            sink.buffered_bytes += self._record_bytes
         super()._process_record_message(message_dict)
         limit_mb = self.config.get("max_buffer_mb")
         if not limit_mb:
@@ -309,8 +312,8 @@ class Targets3(Target):
         # queued records, until the next full drain. Count those too, and write them first, as drain_all does.
         parked = [s for s in self._sinks_to_clear if s.current_size]
         active = list(self._sinks_active.values())
-        if sum(s.buffered_bytes for s in parked + active) > limit_mb * 1024 * 1024:
-            largest = max(parked or active, key=lambda s: s.buffered_bytes)
+        if sum(s.buffered_chars for s in parked + active) > limit_mb * 1024 * 1024:
+            largest = max(parked or active, key=lambda s: s.buffered_chars)
             self.logger.info(
                 "Batches hold more than max_buffer_mb (%d MB). Draining the largest, '%s' (%d records)...",
                 limit_mb, largest.stream_name, largest.current_size,
@@ -328,9 +331,11 @@ class Targets3(Target):
         fail-open on.
         """
         super()._process_endofpipe()
-        # ru_maxrss is in KB on Linux (bytes on macOS). Shows how close a run came to the task's memory.
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024 if sys.platform == "darwin" else 1024)
-        LOGGER.info("target-s3 peak memory: %d MB", peak)
+        if resource is not None:
+            # Peak memory of this target process only; the tap and mapper are separate processes.
+            # ru_maxrss is in KB on Linux (bytes on macOS).
+            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024 if sys.platform == "darwin" else 1024)
+            LOGGER.info("target-s3 peak memory: %d MB", peak)
         try:
             self._emit_extraction_manifest()
         except Exception as exc:  # noqa: BLE001 — must never raise here
@@ -540,8 +545,8 @@ class Targets3(Target):
         :return: deserialized record
         :rtype: dict
         """
-        # Size of the line, so _process_record_message can count the JSON bytes each batch holds.
-        self._record_bytes = len(line)
+        # Length of the line, so the sink that queues this record can count what its batch holds.
+        self.last_line_chars = len(line)
         try:
             self.format = self.config.get("format", None)
             format_parquet = self.format.get("format_parquet", None) or {}

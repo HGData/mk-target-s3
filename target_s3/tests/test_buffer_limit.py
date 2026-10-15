@@ -69,7 +69,7 @@ def test_largest_batch_written_when_all_batches_pass_the_limit(written):
     messages += [record("Lead", i, WIDE_VALUE) for i in range(11)]
     target = run({"max_buffer_mb": 1}, *messages)
     assert written == [("Lead", 11)]
-    assert target._sinks_active["Lead"].buffered_bytes == 0
+    assert target._sinks_active["Lead"].buffered_chars == 0
     assert target._sinks_active["User"].current_size == 5
 
 
@@ -85,14 +85,14 @@ def test_nothing_written_early_when_the_limit_is_not_set(written):
 
 def test_queued_bytes_counted_per_stream(written):
     target = run({}, schema("Lead"), schema("User"), record("Lead", 1, WIDE_VALUE), record("User", 1))
-    lead, user = target._sinks_active["Lead"].buffered_bytes, target._sinks_active["User"].buffered_bytes
+    lead, user = target._sinks_active["Lead"].buffered_chars, target._sinks_active["User"].buffered_chars
     assert lead > 100_000 > user > 0
 
 
 def test_a_full_batch_still_resets_the_count(written):
     target = run({"max_batch_size": 2}, schema("Lead"), record("Lead", 1), record("Lead", 2), record("Lead", 3))
     assert written == [("Lead", 2)]
-    assert 0 < target._sinks_active["Lead"].buffered_bytes < 100
+    assert 0 < target._sinks_active["Lead"].buffered_chars < 100
 
 
 def test_a_batch_parked_by_a_new_schema_counts_and_is_written_first(written):
@@ -102,3 +102,13 @@ def test_a_batch_parked_by_a_new_schema_counts_and_is_written_first(written):
     target = run({"max_buffer_mb": 1}, *messages)
     assert written == [("Lead", 6)]  # the parked batch, not the 5 newer records
     assert target._sinks_active["Lead"].current_size == 5
+
+
+def test_records_a_stream_map_drops_are_not_counted(written):
+    # Only records that are queued count towards max_buffer_mb, so a dropped stream cannot leave a stale count.
+    config = {"max_buffer_mb": 1, "stream_maps": {"User": {"__filter__": "False"}}}
+    target = run(config, schema("Lead"), schema("User"), *[record("User", i, WIDE_VALUE) for i in range(20)],
+                 record("Lead", 1))
+    assert target._sinks_active["User"].buffered_chars == 0
+    assert target._sinks_active["User"].current_size == 0
+    assert written == []
